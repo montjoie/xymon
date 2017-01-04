@@ -1,0 +1,513 @@
+# Xymon tools (C) Corentin Labbe <clabbe.montjoie@gmail.com>
+# Released under GPLv2
+
+# Global variables
+XYMONUSER='xymon'
+DEBUG=0
+#list of tmp files created by the create_tmp() helper
+TMP_FILE_CREATED=""
+ETC_SHADOW_READABLE=0
+umask 027
+XYMON_ETC=""
+#TODO set LC_ALL=C ?
+
+###############################################################################
+###############################################################################
+print_debug()
+{
+	if [ $DEBUG -ge 1 ];then
+		if [ "$1" = '-e' ];then
+			shift
+			echo "$*" >&2
+		else
+			echo -e "$*"
+		fi
+	fi
+}
+
+###############################################################################
+###############################################################################
+print_error()
+{
+	echo "$1" >&2
+}
+
+###################################################################################
+###################################################################################
+xymon_init()
+{
+	local xclihome
+	if [ "$1" = '-d' ];then
+		DEBUG=1
+	fi
+	if [ -z "$XYMON" ] ; then
+		local readonly POSSIBLE_XYMON_CLI_HOME='/usr/xymon/client/ /usr/lib/xymon/client/'
+		local readonly POSSIBLE_XYMON_ETC='/etc/xymon-client/ /etc/xymon/'
+		#must set XYMONCLIENTHOME before sourcing xymonclient.cfg
+		for xclihome in $POSSIBLE_XYMON_CLI_HOME
+		do
+			if [ -e "$xclihome" ];then
+				XYMONCLIENTHOME="$xclihome"
+			fi
+		done
+		if [ -z "$XYMONCLIENTHOME" ];then
+			print_error "ERROR: Cannot find XYMONCLIENTHOME"
+			return 1
+		fi
+		for xclihome in $POSSIBLE_XYMON_ETC
+		do
+			if [ -e "$xclihome/xymonclient.cfg" ];then
+				XYMON_ETC="$xclihome/"
+			fi
+		done
+		. $XYMON_ETC/xymonclient.cfg 2> /dev/null
+		if [ $? -ne 0 ];then
+			print_error "ERROR: Fail to load $xclihome/xymonclient.cfg"
+			return 1
+		fi
+		if [ ! -z "$HOSTNAME" ];then
+			MACHINE="$HOSTNAME"
+		else
+			MACHINE="`uname -n`"
+		fi
+		# on debian MACHINE could be set in /etc/default/xymon-client
+		if [ -e /etc/default/xymon-client ];then
+			. /etc/default/xymon-client
+			if [ ! -z "$CLIENTHOSTNAME" ];then
+				MACHINE="$CLIENTHOSTNAME"
+				print_debug "Got MACHINE=$CLIENTHOSTNAME from /etc/default/xymon-client"
+			fi
+		fi
+		TMPDIR="$XYMONTMP"
+	fi
+	# Debian strech does not have XYMSRV
+	if [ -z "$XYMSRV" -a -e /etc/default/xymon-client ];then
+		. /etc/default/xymon-client
+		XYMSRV="$XYMONSERVERS"
+	fi
+
+	if [ -z "$XYMSRV" ];then
+		print_error "XYMSRV is not set"
+		return 1
+	fi
+	if [ "$XYMSRV" = '0.0.0.0' ];then
+		print_error "Multiple xymon is not handled yet"
+		return 1
+	fi
+
+	# Monitoring must not be greedy
+	#TODO create a function for this
+	renice --priority +15 --pid $$ > /dev/null
+	if [ -x '/usr/bin/ionice' ];then
+		#echo "DEBUG: ionice $$"
+		ionice --class 3 --pid $$
+		if [ $? -ne 0 ];then
+			print_error "ERROR: Cannot ionice"
+		fi
+	fi
+	return 0
+}
+
+xymon_init $* || exit $?
+
+
+###############################################################################
+###############################################################################
+# create a pretty print for terminal output
+print_terminal()
+{
+	echo '<div style="border: solid 2px red;background-color:white;color:black; border-radius: 5px; padding: 6px">' >> $XYSTATE
+}
+end_terminal()
+{
+	echo "</div>" >> $XYSTATE
+}
+
+###############################################################################
+###############################################################################
+# create a temporary file
+# optionnal argument 1: suffix
+create_tmp()
+{
+	if [ -z "$XYSTATE" ];then
+		print_error "ERROR: XYSTATE is empty"
+		return 1
+	fi
+	local suffix="$COLUMN"
+	if [ $# -ge 1 ];then
+		suffix="$1"
+		print_debug "DEBUG: Setting suffix to $suffix"
+	fi
+	TMP_FILE="`mktemp --suffix=$suffix`"
+	if [ $? -ne 0 -o ! -e $TMP_FILE ];then
+		echo "&red Cannot create a tmp file" >> "$XYSTATE"
+		set_color 'red'
+		return 1
+	fi
+	print_debug "DEBUG: Created tmp $TMP_FILE"
+	TMP_FILE_CREATED="$TMP_FILE_CREATED $TMP_FILE"
+	return 0
+}
+
+###############################################################################
+###############################################################################
+check_tmp_create() {
+	if [ -z "$TMP_FILE_CREATED" ];then
+		print_debug "DEBUG: no tmpfile created"
+		return 0
+	fi
+	local tmpfilecreated
+	for tmpfilecreated in $TMP_FILE_CREATED
+	do
+		print_debug "DEBUG: check if $tmpfilecreated is deleted"
+		if [ -e "$tmpfilecreated" ];then
+			echo "ERROR: $tmpfilecreated is not deleted"
+		fi
+	done
+}
+
+###############################################################################
+###############################################################################
+# check for tool $1 and write the result in $3
+# arg 2 is for ?
+# return 0 if the tool is found, 1 otherwise
+check_tool()
+{
+	local retval=1
+	local TMP
+	local tool_ret=666
+	if [ -z "$1" -o -z "$2" -o -z "$3" ];then
+		print_error "ERROR: check_tool no enough arguments"
+		return 1;
+	fi
+	TMP=`mktemp --tmpdir`
+	echo '<fieldset><legend>"'$1'"</legend>' >> $3
+	if [ "$1" = 'lynx' ];then
+		lynx -version |head -n3>> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'iconv' ];then
+		iconv --version |head -n1>> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'wget' ];then
+		wget --version | head -n3 >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'smartctl' ];then
+		smartctl --version | head -n1 >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'sensors' ];then
+		sensors -v >> $3 2>/dev/null
+		tool_ret=$?
+	fi
+	if [ "$1" = 'sed' ];then
+		sed --version |head -n1 >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'equery' ];then
+		equery --no-color -V >> $3 2> /dev/null
+		tool_ret=$?
+	fi
+	if [ "$1" = 'gcc-config' ];then
+		gcc-config --no-color -V >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'eclean-dist' ];then
+		eclean-dist --nocolor --version > $TMP 2> /dev/null
+		tool_ret=$?
+		if [ $tool_ret -eq 0 ];then
+			head -n1 $TMP >> $3
+		fi
+	fi
+	if [ "$1" = 'strings' ];then
+		strings --version | head -n1>> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'lsof' ];then
+		lsof -v 2>>$3 >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'lxc' ];then
+		lxc-stop --version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'qemu' -o "$1" = 'kvm' ];then
+		qemu-kvm -version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'lsusb' ];then
+		lsusb --version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'find' ];then
+		find --version | head -n1>> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'stat' ];then
+		stat --version | head -n2 >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'openssl' ];then
+		openssl version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'aureport' ];then
+		aureport --version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'hwclock' ];then
+		hwclock --version >> $3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'logrotate' ];then
+		logrotate --version >> $3 2>$3
+		tool_ret=$?
+	fi
+	if [ "$1" = 'blkid' ];then
+		blkid -v >> $3 2>&1
+		tool_ret=$?
+		if [ $tool_ret -eq 4 ];then
+			tool_ret=0
+		fi
+	fi
+	if [ "$1" = 'host' ];then
+		host -V 2>$3 >>$3
+		tool_ret=$?
+	fi
+
+	if [ $tool_ret -eq 0 ];then
+		echo "&green $1 present" >> $3
+		retval=0
+	else
+		echo "&red $1 non present (ret=$tool_ret)" >> $3
+		retval=1
+	fi
+	echo '</fieldset>' >> $3
+	rm $TMP
+	return $retval
+}
+
+###############################################################################
+###############################################################################
+#--se selinuxcontext if selinux is used
+#-u user
+m_runas() {
+	local m_runas_con=""
+	local m_user=""
+
+	while [ $# -ge 1 ];do
+		case $1 in
+		'--')
+			shift
+			break
+		;;
+		--se)
+			shift
+			m_runas_con="$1"
+			print_debug -e "DEBUG: will run with con $m_runas_con"
+			shift
+		;;
+		-u)
+			shift
+			m_user="$1"
+			shift
+		;;
+		*)
+			print_error "ERROR: invalid argument $1"
+			return 1
+		;;
+		esac
+	done
+	if [ ! -e /etc/selinux ];then
+		if [ -z "$m_user" ];then
+			print_debug -e "DEBUG: m_run_as with $*"
+			$*
+		else
+			print_debug -e "DEBUG: m_run_as with user $m_user $*"
+			su - $m_user -s /bin/bash -c "$*"
+		fi
+		return $?
+	fi
+	if [ $# -lt 1 ];then
+		print_error "ERROR: Missing argument to m_runas $*"
+		return 1
+	fi
+	if [ -z "$m_user" ];then
+		if [ -z "$m_runas_con" ];then
+			$*
+		else
+			print_debug -e "DEBUG: m_run_as con=$m_runas_con with $*"
+			runcon -t $m_runas_con $*
+		fi
+	else
+		if [ -z "$m_runas_con" ];then
+			print_debug -e "DEBUG: m_run_as user=$m_user runuser simple for $*"
+			runuser --login $m_user -s /bin/bash -c "$*"
+		else
+			print_debug -e "DEBUG: m_run_as con=$m_runas_con user=$m_user with $*"
+			runcon -t $m_runas_con runuser $m_user -s /bin/bash -c "$*"
+		fi
+	fi
+	return $?
+}
+
+###################################################################################
+###################################################################################
+set_color()
+{
+	if [ "$1" != 'yellow' -a "$1" != 'red' ];then
+		echo "Erreur: bad color $1" 1>&2
+		exit 1
+	fi
+	if [ "$COLOR" = 'red' -a "$1" = 'yellow' ];then
+		return 0;
+	fi
+	COLOR="$1"
+}
+
+###################################################################################
+###################################################################################
+add_sonde_version()
+{
+	if [ $# -ne 1 ];then
+		print_error "ERROR: missing #1 for add_sonde_version"
+		return 1
+	fi
+	if [ -z "$SONDE_VERSION" ];then
+		SONDE_VERSION=0
+	fi
+	echo "<div class='sondeversion' align=right><i>reported by $0 on `uname -n` v0 IO=`ionice` NICE=`nice`</i></div>" >> $1
+	if [ -e /etc/selinux ];then
+		echo "<div class='launchby' align=right><i>launched by `id`</i></div>" >> $1
+	fi
+}
+
+###################################################################################
+###################################################################################
+# arg 1 is status
+# arg2 is color
+xymon_finish2()
+{
+	local do_tmp_check=1
+	if [ "$1" = '--notmpcheck' ];then
+		do_tmp_check=0
+		shift
+	fi
+	if [ -z "$1" ];then
+		print_error "ERROR: missing status file"
+		exit 1
+	fi
+	if [ ! -e "$1" ];then
+		print_error "ERROR: status file does not exists"
+		exit 1
+	fi
+	print_debug "DEBUG: Xymon finish2 $COLOR envoie de $1"
+	if [ $do_tmp_check -eq 1 ];then
+		check_tmp_create
+	fi
+
+	if [ $# -le 1 ];then
+		sed -i "s,__X_COLOR__,$COLOR," $1
+	else
+		sed -i "s,__X_COLOR__,$2," $1
+	fi
+	m_runas -u $XYMONUSER -- "$XYMON $XYMSRV '@' < $1"
+	return $?
+}
+
+################################################################################
+################################################################################
+#http://www.xymon.com/xymon/help/manpages/man1/xymon.1.html
+# disable HOSTNAME.TESTNAME DURATION <additional text>
+xymon_disable_host()
+{
+	if [ -z "$1" ];then
+		print_error "ERROR: missing machine name"
+	fi
+	if [ -z "$2" ];then
+		print_error "ERROR: missing testname"
+	fi
+	if [ -z "$3" ];then
+		print_error "ERROR: missing duration"
+	fi
+	print_debug "Xymon disable sur $1 $2"
+	su - $XYMONUSER -s /bin/bash -c "$XYMON $XYMSRV \"disable $1.$2 $3\""
+	if [ ! -z "`ps aux |grep 'fsxymon$'`" ];then
+		su - $XYMONUSER -s /bin/bash -c "XYMONDPORT=1985 $XYMON $XYMSRV \"disable $1.$2 $3\""
+	fi
+}
+
+################################################################################
+################################################################################
+xymon_enable_host()
+{
+	if [ -z "$1" ];then
+		print_error "ERROR: missing machine name"
+	fi
+	if [ -z "$2" ];then
+		print_error "ERROR: missing testname"
+	fi
+	print_debug "Xymon enable sur $1 $2"
+	su - $XYMONUSER -s /bin/bash -c "$XYMON $XYMSRV \"enable $1.$2\""
+}
+
+###############################################################################
+###############################################################################
+detect_rpi() {
+	RASPBERRYPI='no'
+	if [ ! -e /proc/acpi ];then
+		if [ ! -z "`grep 'Hardware.*BCM2708' /proc/cpuinfo`" ];then
+			RASPBERRYPI='yes'
+		fi
+	fi
+}
+
+###############################################################################
+# create XYSTATE for output results
+# create XYSTATE_ERR for temporary errors output
+prepare_xymon_state() {
+	print_debug "DEBUG: prepare_xymon_state with $1"
+	SUFFIX=''
+	if [ -z "$1" ] ;then
+		SUFFIX='default'
+	else
+		SUFFIX="$1"
+	fi
+	XYSTATE="$TMPDIR/${SUFFIX}.out"
+	> $XYSTATE
+	#TODO $xygrp
+	chgrp xymon $XYSTATE
+	if [ $? -ne 0 ];then
+		print_error "ERROR: Cannot chgrp $XYSTATE"
+	fi
+	XYSTATE_ERR="$TMPDIR/${SUFFIX}.err"
+	> $XYSTATE_ERR
+}
+
+###############################################################################
+###############################################################################
+state_add() {
+	echo "$@" >> "$XYSTATE"
+}
+
+###############################################################################
+###############################################################################
+#check if a DNS resolve
+check_if_resolve() {
+	check_tool host "DEFAULT" /dev/null
+	if [ $? -ne 0 ];then
+		state_add "&clear Cannot test without host"
+		return 0
+	fi
+	host $1 > /dev/null 2>/dev/null
+	if [ $? -eq 0 ];then
+		state_add "&green $1 resolve"
+		return 0
+	else
+		state_add "&red $1 does not resolve"
+		return 1
+	fi
+}
+
